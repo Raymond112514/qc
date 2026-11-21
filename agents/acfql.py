@@ -7,8 +7,6 @@ import jax.numpy as jnp
 import ml_collections
 import numpy as np
 import optax
-from flax.core import unfreeze
-
 from utils.encoders import encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
 from utils.networks import ActorVectorField, Value
@@ -20,7 +18,7 @@ class ACFQLAgent(flax.struct.PyTreeNode):
     rng: Any
     network: Any
     config: Any = nonpytree_field()
-    # Decode a = mean + (pca_bound * tanh(u) * std) @ components. components is (K, D).
+    # Decode a = clip(mean + (z * pca_bound * std) @ components, -1, 1). z is not clipped.
     pca_mean: Any = None
     pca_components: Any = None
     pca_scale: Any = None
@@ -30,14 +28,14 @@ class ACFQLAgent(flax.struct.PyTreeNode):
 
         batch_actions = self._flat_actions(batch["actions"])
         if self.config["pca_latent"]:
-            batch_actions = self._chunk_to_coords(batch_actions)
+            batch_actions = self._chunk_to_latent(batch_actions)
 
         # TD loss
         rng, sample_rng = jax.random.split(rng)
         next_obs = batch['next_observations'][..., -1, :]
         if self.config["pca_latent"]:
-            # Bootstrap in coordinate space. sample_actions decodes to env chunks.
-            next_actions = self._sample_latent_coords(next_obs, sample_rng)
+            # Bootstrap in latent space. sample_actions decodes to env chunks.
+            next_actions = self._onestep_latent(next_obs, sample_rng)
         else:
             next_actions = self.sample_actions(next_obs, rng=sample_rng)
 
@@ -65,7 +63,7 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         """Compute the FQL actor loss."""
         batch_actions = self._flat_actions(batch["actions"])
         if self.config["pca_latent"]:
-            batch_actions = self._chunk_to_coords(batch_actions)
+            batch_actions = self._chunk_to_latent(batch_actions)
         batch_size, action_dim = batch_actions.shape
         rng, x_rng, t_rng = jax.random.split(rng, 3)
 
@@ -80,7 +78,7 @@ class ACFQLAgent(flax.struct.PyTreeNode):
 
         # only bc on the valid chunk indices
         if self.config["pca_latent"]:
-            # One coordinate vector per chunk. Drop chunks that cross a terminal.
+            # One latent per chunk. Drop chunks that cross a terminal.
             bc_flow_loss = jnp.mean(jnp.mean((pred - vel) ** 2, axis=-1) * batch["valid"][..., -1])
         elif self.config["action_chunking"]:
             bc_flow_loss = jnp.mean(
@@ -97,27 +95,13 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             rng, noise_rng = jax.random.split(rng)
             noises = jax.random.normal(noise_rng, (batch_size, action_dim))
             target_flow_actions = self.compute_flow_actions(batch['observations'], noises=noises)
-            if self.config["pca_k"] and not self.config["pca_latent"]:
-                # Online-only head. Flow and critic stay in the full chunk space.
-                # Actor noise is the flow noise in the PCA basis (rows of P are orthonormal).
-                actor_noises = noises @ self.pca_components.T
-                raw = self.network.select('actor_onestep_flow')(
-                    batch['observations'], actor_noises, params=grad_params
-                )
-                limit = self._coord_limit()
-                pred_c = jnp.tanh(raw) * limit
-                target_c = (target_flow_actions - self.pca_mean) @ self.pca_components.T
-                target_c = jnp.clip(target_c, -limit, limit)
-                distill_loss = jnp.mean((pred_c - target_c) ** 2)
-                actor_actions = self.pca_mean + pred_c @ self.pca_components
-            else:
-                actor_actions = self.network.select('actor_onestep_flow')(
-                    batch['observations'], noises, params=grad_params
-                )
-                distill_loss = jnp.mean((actor_actions - target_flow_actions) ** 2)
-
-            # Q loss.
-            actor_actions = jnp.clip(actor_actions, -1, 1)
+            actor_actions = self.network.select('actor_onestep_flow')(
+                batch['observations'], noises, params=grad_params
+            )
+            distill_loss = jnp.mean((actor_actions - target_flow_actions) ** 2)
+            # pca_latent keeps actor_actions in latent space. Clip only env actions.
+            if not self.config["pca_latent"]:
+                actor_actions = jnp.clip(actor_actions, -1, 1)
 
             qs = self.network.select(f'critic')(batch['observations'], actions=actor_actions)
             q = jnp.mean(qs, axis=0)
@@ -196,11 +180,7 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         if self.config["actor_type"] == "distill-ddpg":
             batch_shape = observations.shape[: -len(self.config['ob_dims'])]
             if self.config["pca_latent"]:
-                actions = self._coords_to_chunk(self._sample_latent_coords(observations, rng))
-            elif self.config["pca_k"]:
-                noises = jax.random.normal(rng, (*batch_shape, self.config["pca_k"]))
-                raw = self.network.select('actor_onestep_flow')(observations, noises)
-                actions = self.pca_mean + (jnp.tanh(raw) * self._coord_limit()) @ self.pca_components
+                actions = self._latent_to_chunk(self._onestep_latent(observations, rng))
             else:
                 noises = jax.random.normal(
                     rng,
@@ -255,7 +235,8 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             t = jnp.full((*observations.shape[:-1], 1), i / self.config['flow_steps'])
             vels = self.network.select('actor_bc_flow')(observations, actions, t, is_encoded=True)
             actions = actions + vels / self.config['flow_steps']
-        actions = jnp.clip(actions, -1, 1)
+        if not self.config["pca_latent"]:
+            actions = jnp.clip(actions, -1, 1)
         return actions
 
     def _flat_actions(self, actions):
@@ -263,68 +244,23 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             return jnp.reshape(actions, (actions.shape[0], -1))
         return actions[..., 0, :]
 
-    def _coord_limit(self):
-        """Half-width of each component in action units: s standard deviations."""
+    def _latent_scale(self):
+        """Action-space width of one latent unit: pca_bound standard deviations."""
         return self.pca_scale * self.config["pca_bound"]
 
-    def _chunk_to_coords(self, flat_actions):
-        """Coordinates in [-1, 1]. ±1 is ±pca_bound standard deviations."""
-        raw = (flat_actions - self.pca_mean) @ self.pca_components.T
-        return jnp.clip(raw / self._coord_limit(), -1.0, 1.0)
+    def _chunk_to_latent(self, flat_actions):
+        """Project a flat action chunk to an unclipped PCA latent."""
+        return (flat_actions - self.pca_mean) @ self.pca_components.T / self._latent_scale()
 
-    def _coords_to_chunk(self, coords):
-        flat = self.pca_mean + (coords * self._coord_limit()) @ self.pca_components
+    def _latent_to_chunk(self, latent):
+        """Decode a PCA latent and clip the chunk to the original action box."""
+        flat = self.pca_mean + (latent * self._latent_scale()) @ self.pca_components
         return jnp.clip(flat, -1.0, 1.0)
 
-    def _sample_latent_coords(self, observations, rng):
+    def _onestep_latent(self, observations, rng):
         batch_shape = observations.shape[: -len(self.config["ob_dims"])]
         noises = jax.random.normal(rng, (*batch_shape, self.config["pca_k"]))
-        raw = self.network.select("actor_onestep_flow")(observations, noises)
-        return jnp.clip(raw, -1.0, 1.0)
-
-    def enable_online_pca(self, mean, components, scale):
-        """Swap the one-step actor for a K-dimensional PCA head. Critic and flow stay."""
-        if self.config["pca_latent"]:
-            raise ValueError("online PCA head is separate from full-run coordinate training")
-        if self.config["actor_type"] != "distill-ddpg":
-            raise ValueError("online PCA actor is implemented for distill-ddpg")
-        if not self.config["action_chunking"]:
-            raise ValueError("online PCA actor expects action chunking")
-
-        mean = jnp.asarray(mean, dtype=jnp.float32)
-        components = jnp.asarray(components, dtype=jnp.float32)  # (K, D)
-        scale = jnp.asarray(scale, dtype=jnp.float32)
-        k, d = int(components.shape[0]), int(components.shape[1])
-        full_dim = self.config["action_dim"] * self.config["horizon_length"]
-        if d != full_dim:
-            raise ValueError(f"PCA width {d} does not match chunk dim {full_dim}")
-
-        rng, init_rng = jax.random.split(self.rng)
-        ex_observations = jnp.zeros(tuple(self.config["ob_dims"]), dtype=jnp.float32)
-        full_actions = jnp.zeros((d,), dtype=jnp.float32)
-        onestep_actions = jnp.zeros((k,), dtype=jnp.float32)
-        network = _build_train_state(
-            self.config, ex_observations, full_actions, onestep_actions, init_rng
-        )
-
-        new_params = unfreeze(network.params)
-        old_params = unfreeze(self.network.params)
-        for key, value in old_params.items():
-            if key == "modules_actor_onestep_flow":
-                continue
-            new_params[key] = value
-        # Keep the dict mutable: target_update assigns into network.params.
-        network = TrainState.create(network.model_def, new_params, tx=network.tx)
-
-        config = flax.core.FrozenDict({**self.config, "pca_k": k})
-        return self.replace(
-            rng=rng,
-            network=network,
-            config=config,
-            pca_mean=mean,
-            pca_components=components,
-            pca_scale=scale,
-        )
+        return self.network.select("actor_onestep_flow")(observations, noises)
 
     @classmethod
     def create(
@@ -350,13 +286,13 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         if config["pca_latent"]:
             if not config["pca_k"]:
                 raise ValueError("pca_latent requires pca_k")
-            # Critic, flow, and one-step actor all take normalized PCA coordinates.
+            # Critic, flow, and one-step actor all take PCA latents.
             full_actions = jnp.zeros((config["pca_k"],), dtype=jnp.float32)
         elif config["action_chunking"]:
             full_actions = jnp.concatenate([ex_actions] * config["horizon_length"], axis=-1)
         else:
             full_actions = ex_actions
-        network = _build_train_state(config, ex_observations, full_actions, full_actions, init_rng)
+        network = _build_train_state(config, ex_observations, full_actions, init_rng)
 
         config['ob_dims'] = ob_dims
         config['action_dim'] = action_dim
@@ -364,11 +300,10 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         return cls(rng, network=network, config=flax.core.FrozenDict(**config))
 
 
-def _build_train_state(config, ex_observations, full_actions, onestep_actions, init_rng):
-    """Build critic, flow, and one-step actor. The one-step actor width is onestep_actions."""
+def _build_train_state(config, ex_observations, full_actions, init_rng):
+    """Build critic, flow, and one-step actor."""
     ex_times = full_actions[..., :1]
     full_action_dim = full_actions.shape[-1]
-    onestep_action_dim = onestep_actions.shape[-1]
 
     encoders = dict()
     if config['encoder'] is not None:
@@ -393,14 +328,14 @@ def _build_train_state(config, ex_observations, full_actions, onestep_actions, i
     )
     actor_onestep_flow_def = ActorVectorField(
         hidden_dims=config['actor_hidden_dims'],
-        action_dim=onestep_action_dim,
+        action_dim=full_action_dim,
         layer_norm=config['actor_layer_norm'],
         encoder=encoders.get('actor_onestep_flow'),
     )
 
     network_info = dict(
         actor_bc_flow=(actor_bc_flow_def, (ex_observations, full_actions, ex_times)),
-        actor_onestep_flow=(actor_onestep_flow_def, (ex_observations, onestep_actions)),
+        actor_onestep_flow=(actor_onestep_flow_def, (ex_observations, full_actions)),
         critic=(critic_def, (ex_observations, full_actions)),
         target_critic=(copy.deepcopy(critic_def), (ex_observations, full_actions)),
     )
@@ -427,7 +362,7 @@ def fit_chunk_pca(dataset, horizon, k=None, variance=None, seed=0, max_chunks=20
     k fixes the width. variance, in (0, 1], instead picks the smallest width whose
     cumulative explained variance reaches that fraction. Returns mean (D,),
     components (K, D), per-component std (K,), and the cumulative fraction.
-    The decode is mean + (pca_bound * std * tanh(u)) @ components.
+    The decode is clip(mean + (pca_bound * std * z) @ components, -1, 1). z is not clipped.
     """
     actions = np.asarray(dataset['actions'])
     starts = []
@@ -498,9 +433,9 @@ def get_config():
             action_chunking=True,  # False means n-step return
             actor_type="distill-ddpg",
             actor_num_samples=32,  # for actor_type="best-of-n" only
-            pca_k=0,  # PCA coordinate width. 0 keeps the full chunk.
-            pca_latent=False,  # True: critic, flow, and one-step actor train in PCA coordinates from the start.
-            pca_bound=1.0,  # Standard deviations reached by ±1 coordinate. The decoded half-width is pca_bound * std.
+            pca_k=0,  # PCA latent width. 0 keeps the full chunk.
+            pca_latent=False,  # True: critic, flow, and one-step actor train in the PCA latent.
+            pca_bound=1.0,  # One latent unit is this many standard deviations. Latents are not clipped.
             use_fourier_features=False,
             fourier_feature_dim=64,
             weight_decay=0.,

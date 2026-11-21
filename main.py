@@ -49,8 +49,7 @@ flags.DEFINE_integer('dataset_replace_interval', 1000, 'Dataset replace interval
 flags.DEFINE_string('ogbench_dataset_dir', None, 'OGBench dataset directory')
 
 flags.DEFINE_integer('horizon_length', 5, 'action chunking length.')
-flags.DEFINE_integer('online_pca_k', 0, 'Online one-step actor PCA dimension. 0 keeps the full chunk actor.')
-flags.DEFINE_integer('pca_k', 0, 'If > 0, train critic, flow, and one-step actor in this many PCA coordinates for both phases.')
+flags.DEFINE_integer('pca_k', 0, 'If > 0, train critic, flow, and one-step actor in this many PCA latents.')
 flags.DEFINE_float('pca_variance', 0., 'If > 0, choose the smallest K that reaches this explained-variance fraction. 0.95 and 95 both mean 95%.')
 flags.DEFINE_bool('sparse', False, "make the task sparse reward")
 
@@ -80,11 +79,8 @@ def _run_label(k=None):
     env = FLAGS.env_name.replace("-play", "").replace("-v0", "")
     parts = [env, f"h{FLAGS.horizon_length}", f"s{FLAGS.seed}"]
     variance = _variance_fraction()
-    if FLAGS.online_pca_k > 0 and FLAGS.pca_k <= 0:
-        tag = "pca-online"
-        width = FLAGS.online_pca_k
-    elif FLAGS.pca_k > 0 or variance > 0.0:
-        tag = "pca-both"
+    if FLAGS.pca_k > 0 or variance > 0.0:
+        tag = "pca"
         width = FLAGS.pca_k
     else:
         tag = ""
@@ -182,10 +178,7 @@ def main(_):
     pca_variance = _variance_fraction()
     if pca_variance < 0.0 or pca_variance > 1.0:
         raise ValueError(f"--pca_variance must be in (0, 1] or (1, 100], got {FLAGS.pca_variance}")
-    if FLAGS.pca_k > 0 and FLAGS.online_pca_k > 0:
-        raise ValueError("Use either --pca_k or --online_pca_k, not both.")
-    # A variance target with no integer K trains in PCA coordinates for both phases.
-    use_pca_latent = FLAGS.pca_k > 0 or (pca_variance > 0.0 and FLAGS.online_pca_k <= 0)
+    use_pca_latent = FLAGS.pca_k > 0 or pca_variance > 0.0
     if use_pca_latent:
         pca_mean, pca_components, pca_scale, pca_explained = fit_chunk_pca(
             train_dataset,
@@ -202,7 +195,7 @@ def main(_):
         )
         wandb.run.name = _run_label(k=config["pca_k"])
         print(
-            f"PCA coordinate training k={config['pca_k']} explained={pca_explained:.3f} name={wandb.run.name}",
+            f"PCA latent training k={config['pca_k']} explained={pca_explained:.3f} name={wandb.run.name}",
             flush=True,
         )
 
@@ -275,24 +268,6 @@ def main(_):
                 video_frame_skip=FLAGS.video_frame_skip,
             )
             logger.log(eval_info, "eval", step=log_step)
-
-    # transition from offline to online
-    if FLAGS.online_pca_k > 0 and FLAGS.online_steps > 0:
-        pca_mean, pca_components, pca_scale, pca_explained = fit_chunk_pca(
-            train_dataset,
-            FLAGS.horizon_length,
-            k=None if pca_variance > 0.0 else FLAGS.online_pca_k,
-            variance=pca_variance if pca_variance > 0.0 else None,
-            seed=FLAGS.seed,
-        )
-        np.savez(
-            os.path.join(FLAGS.save_dir, 'online_pca.npz'),
-            mean=pca_mean, components=pca_components, scale=pca_scale, explained=pca_explained,
-        )
-        agent = agent.enable_online_pca(pca_mean, pca_components, pca_scale)
-        wandb.run.name = _run_label(k=int(pca_components.shape[0]))
-        wandb.log({'pca/explained_variance': pca_explained, 'pca/k': int(pca_components.shape[0])}, step=log_step)
-        print(f"online one-step actor is PCA k={pca_components.shape[0]} name={wandb.run.name}", flush=True)
 
     replay_buffer = ReplayBuffer.create_from_initial_dataset(
         dict(train_dataset), size=max(FLAGS.buffer_size, train_dataset.size + 1)
