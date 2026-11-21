@@ -5,13 +5,6 @@ import numpy as np
 import gymnasium as gym
 from gymnasium.spaces import Box
 import imageio
-import h5py
-
-import robomimic.utils.env_utils as EnvUtils
-import robomimic.utils.file_utils as FileUtils
-import robomimic.utils.env_utils as EnvUtils
-import robomimic.utils.obs_utils as ObsUtils
-from robomimic import DATASET_REGISTRY
 
 from utils.datasets import Dataset
 
@@ -28,7 +21,17 @@ low_dim_keys = {"low_dim": ('robot0_eef_pos',
     'robot0_eef_quat',
     'robot0_gripper_qpos',
     'object')}
-ObsUtils.initialize_obs_modality_mapping_from_dict(low_dim_keys)
+
+
+def _import_robomimic():
+    """Import robomimic only when a robomimic env is actually used."""
+    import h5py
+    import robomimic.utils.env_utils as EnvUtils
+    import robomimic.utils.file_utils as FileUtils
+    import robomimic.utils.obs_utils as ObsUtils
+
+    ObsUtils.initialize_obs_modality_mapping_from_dict(low_dim_keys)
+    return h5py, EnvUtils, FileUtils
 
 
 def _get_max_episode_length(env_name):
@@ -52,6 +55,7 @@ def make_env(env_name, seed=0):
     """
     # _download_dataset_and_metadata(env_name)
     dataset_path = _check_dataset_exists(env_name)
+    _, EnvUtils, FileUtils = _import_robomimic()
 
     env_meta = FileUtils.get_env_metadata_from_dataset(dataset_path)
     max_episode_length = _get_max_episode_length(env_name)
@@ -85,6 +89,7 @@ def _check_dataset_exists(env_name):
 
 def get_dataset(env, env_name):
     dataset_path = _check_dataset_exists(env_name)
+    h5py, _, _ = _import_robomimic()
 
     rm_dataset = h5py.File(dataset_path, "r")
     demos = list(rm_dataset["data"].keys())

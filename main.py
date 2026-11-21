@@ -12,6 +12,7 @@ from utils.datasets import Dataset, ReplayBuffer
 
 from evaluation import evaluate
 from agents import agents
+from agents.acfql import fit_chunk_pca
 import numpy as np
 
 if 'CUDA_VISIBLE_DEVICES' in os.environ:
@@ -48,6 +49,9 @@ flags.DEFINE_integer('dataset_replace_interval', 1000, 'Dataset replace interval
 flags.DEFINE_string('ogbench_dataset_dir', None, 'OGBench dataset directory')
 
 flags.DEFINE_integer('horizon_length', 5, 'action chunking length.')
+flags.DEFINE_integer('online_pca_k', 0, 'Online one-step actor PCA dimension. 0 keeps the full chunk actor.')
+flags.DEFINE_integer('pca_k', 0, 'If > 0, train critic, flow, and one-step actor in this many PCA coordinates for both phases.')
+flags.DEFINE_float('pca_variance', 0., 'If > 0, choose the smallest K that reaches this explained-variance fraction. 0.95 and 95 both mean 95%.')
 flags.DEFINE_bool('sparse', False, "make the task sparse reward")
 
 flags.DEFINE_bool('save_all_online_states', False, "save all trajectories to npy")
@@ -64,9 +68,46 @@ class LoggingHelper:
         self.csv_loggers[prefix].log(data, step=step)
         self.wandb_logger.log({f'{prefix}/{k}': v for k, v in data.items()}, step=step)
 
+def _variance_fraction():
+    value = float(FLAGS.pca_variance)
+    if value > 1.0:
+        value = value / 100.0
+    return value
+
+
+def _run_label(k=None):
+    """Wandb display name: task, chunk length, seed, and PCA setting."""
+    env = FLAGS.env_name.replace("-play", "").replace("-v0", "")
+    parts = [env, f"h{FLAGS.horizon_length}", f"s{FLAGS.seed}"]
+    variance = _variance_fraction()
+    if FLAGS.online_pca_k > 0 and FLAGS.pca_k <= 0:
+        tag = "pca-online"
+        width = FLAGS.online_pca_k
+    elif FLAGS.pca_k > 0 or variance > 0.0:
+        tag = "pca-both"
+        width = FLAGS.pca_k
+    else:
+        tag = ""
+        width = 0
+    if tag:
+        if variance > 0.0:
+            tag += f"-var{int(round(variance * 100))}"
+        if k is not None:
+            tag += f"-k{int(k)}"
+        elif width > 0 and variance <= 0.0:
+            tag += f"-k{int(width)}"
+        bound = float(FLAGS.agent.pca_bound)
+        if bound != 1.0:
+            tag += f"-b{bound:g}"
+        parts.append(tag)
+    else:
+        parts.append("fullchunk")
+    return "_".join(parts)
+
+
 def main(_):
     exp_name = get_exp_name(FLAGS.seed)
-    run = setup_wandb(project='qc', group=FLAGS.run_group, name=exp_name)
+    run = setup_wandb(project='qc', group=FLAGS.run_group, name=_run_label())
     
     FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, FLAGS.env_name, exp_name)
     os.makedirs(FLAGS.save_dir, exist_ok=True)
@@ -137,7 +178,34 @@ def main(_):
     
     train_dataset = process_train_dataset(train_dataset)
     example_batch = train_dataset.sample(())
-    
+
+    pca_variance = _variance_fraction()
+    if pca_variance < 0.0 or pca_variance > 1.0:
+        raise ValueError(f"--pca_variance must be in (0, 1] or (1, 100], got {FLAGS.pca_variance}")
+    if FLAGS.pca_k > 0 and FLAGS.online_pca_k > 0:
+        raise ValueError("Use either --pca_k or --online_pca_k, not both.")
+    # A variance target with no integer K trains in PCA coordinates for both phases.
+    use_pca_latent = FLAGS.pca_k > 0 or (pca_variance > 0.0 and FLAGS.online_pca_k <= 0)
+    if use_pca_latent:
+        pca_mean, pca_components, pca_scale, pca_explained = fit_chunk_pca(
+            train_dataset,
+            FLAGS.horizon_length,
+            k=None if pca_variance > 0.0 else FLAGS.pca_k,
+            variance=pca_variance if pca_variance > 0.0 else None,
+            seed=FLAGS.seed,
+        )
+        config["pca_k"] = int(pca_components.shape[0])
+        config["pca_latent"] = True
+        np.savez(
+            os.path.join(FLAGS.save_dir, 'pca.npz'),
+            mean=pca_mean, components=pca_components, scale=pca_scale, explained=pca_explained,
+        )
+        wandb.run.name = _run_label(k=config["pca_k"])
+        print(
+            f"PCA coordinate training k={config['pca_k']} explained={pca_explained:.3f} name={wandb.run.name}",
+            flush=True,
+        )
+
     agent_class = agents[config['agent_name']]
     agent = agent_class.create(
         FLAGS.seed,
@@ -145,6 +213,13 @@ def main(_):
         example_batch['actions'],
         config,
     )
+    if use_pca_latent:
+        agent = agent.replace(
+            pca_mean=jax.numpy.asarray(pca_mean),
+            pca_components=jax.numpy.asarray(pca_components),
+            pca_scale=jax.numpy.asarray(pca_scale),
+        )
+        wandb.log({'pca/explained_variance': pca_explained, 'pca/k': int(pca_components.shape[0])}, step=log_step)
 
     # Setup logging.
     prefixes = ["eval", "env"]
@@ -202,6 +277,23 @@ def main(_):
             logger.log(eval_info, "eval", step=log_step)
 
     # transition from offline to online
+    if FLAGS.online_pca_k > 0 and FLAGS.online_steps > 0:
+        pca_mean, pca_components, pca_scale, pca_explained = fit_chunk_pca(
+            train_dataset,
+            FLAGS.horizon_length,
+            k=None if pca_variance > 0.0 else FLAGS.online_pca_k,
+            variance=pca_variance if pca_variance > 0.0 else None,
+            seed=FLAGS.seed,
+        )
+        np.savez(
+            os.path.join(FLAGS.save_dir, 'online_pca.npz'),
+            mean=pca_mean, components=pca_components, scale=pca_scale, explained=pca_explained,
+        )
+        agent = agent.enable_online_pca(pca_mean, pca_components, pca_scale)
+        wandb.run.name = _run_label(k=int(pca_components.shape[0]))
+        wandb.log({'pca/explained_variance': pca_explained, 'pca/k': int(pca_components.shape[0])}, step=log_step)
+        print(f"online one-step actor is PCA k={pca_components.shape[0]} name={wandb.run.name}", flush=True)
+
     replay_buffer = ReplayBuffer.create_from_initial_dataset(
         dict(train_dataset), size=max(FLAGS.buffer_size, train_dataset.size + 1)
     )
